@@ -1,0 +1,13 @@
+# CMake/Ninja build output
+build/
+*_artefacts/
+Fullteq_artefacts/
+
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Local IDE metadata
+.vscode/
+.idea/
