@@ -2,6 +2,8 @@
 #include "PluginEditor.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace
 {
@@ -165,10 +167,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout FullteqAudioProcessor::creat
                                                             juce::String(), juce::AudioProcessorParameter::genericParameter,
                                                             percentToText, percentFromText));
 
-    layout.add (std::make_unique<juce::AudioParameterBool> ("tube", "Tube Stage", true));
-    layout.add (std::make_unique<juce::AudioParameterBool> ("transformer", "Transformer", true));
-    layout.add (std::make_unique<juce::AudioParameterBool> ("input", "In", true));
-    layout.add (std::make_unique<juce::AudioParameterBool> ("bypass", "Bypass", false));
+    // Bool parameters are stored as stepped 0/1 floats so state save/restore
+    // (and pluginval's state-restoration test) round-trips the exact value.
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("tube", "Tube Stage",
+                juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f), 1.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("transformer", "Transformer",
+                juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f), 1.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("input", "In",
+                juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f), 1.0f));
+    layout.add (std::make_unique<juce::AudioParameterFloat> ("bypass", "Bypass",
+                juce::NormalisableRange<float> (0.0f, 1.0f, 1.0f), 0.0f));
 
     return layout;
 }
@@ -185,30 +193,58 @@ FullteqAudioProcessor::BandCoefficients FullteqAudioProcessor::computeBandCoeffi
     BandCoefficients band;
 
     // Low band. Boost and attenuation are separate shelves that load each
-    // other. The attenuation shelf sits higher (x1.5) and is gentler, so with
-    // both engaged the boost survives below the corner while a dip opens up
-    // above it - the "trick". Constants were tuned against the analytic
-    // response: boost 8 / atten 8 at 60 Hz gives about +3.5 dB at 20-30 Hz and
-    // -2.4 dB near 110 Hz, flat again above 500 Hz.
+    // other; the attenuation shelf sits much higher, so with both engaged the
+    // boost survives below its corner while a dip opens up above it - the
+    // "trick".
+    //
+    // Low shelves follow the measured turnover table (see the constants in the
+    // header). The boost corner is a fixed 700 Hz: every dial swings the same
+    // amplitude below it, which is why a 60 Hz boost already reaches down to
+    // 15 Hz (the "whole low end", not a 60 Hz bell). Measured turnover ratios
+    // per dial (100/200/300/700 Hz against 20/30/60/100 Hz) average 4.25 and
+    // differ by only +-15 %, so one corner is enough and keeps the levels that
+    // the tests and presets already expect. The cut corner is the dial times
+    // kLowAttenCornerRatio (250/400/800/1500 Hz against 20/30/60/100 Hz), which
+    // reproduces the measured table exactly. The dial sets the amplitude: the
+    // boost reproduces the old level at 100 Hz (+8.3 dB below 25 Hz at boost 8),
+    // the cut is anchored on its measured plateau.
     const double q = static_cast<double> (lowQ);
-    makeLowShelf (band.stages[0], sampleRate, lowFrequencyHz, 0.9 * q, lowBoostDb);
-    makeLowShelf (band.stages[1], sampleRate, lowFrequencyHz * 1.5, 0.4 * q, -0.65 * static_cast<double> (lowAttenDb));
+    const double dialHz = juce::jmax (10.0, static_cast<double> (lowFrequencyHz));
+    const double boostGain = static_cast<double> (lowBoostDb) * std::sqrt (dialHz / kLowBoostRefDial);
+    const double cutGain = -kLowAttenMaxDb * static_cast<double> (lowAttenDb) / 8.0
+                         * std::pow (static_cast<double> (kLowAttenRefDial) / dialHz, kLowAttenDialTilt);
+
+    // The boost corner is fixed at 700 Hz and the boost is anchored on the
+    // 100 Hz dial (+8.3 dB below 25 Hz at boost 8, the level this plug-in
+    // already produced); the lower dials scale up by sqrt so 8 dB at 20 Hz
+    // gives about +3.7 dB below 100 Hz. The cut corner is dial * 9.33
+    // (measured 250/400/800/1500 Hz) and its plateau is anchored at -12 dB.
+    makeLowShelf (band.stages[0], sampleRate, kLowBoostCornerHz, 0.9 * q, boostGain);
+    makeLowShelf (band.stages[1], sampleRate, dialHz * kLowAttenCornerRatio, 0.4 * q, cutGain);
 
     // High band. Bandwidth 0 (SHARP) .. 10 (BROAD) sweeps the resonant boost
     // from Q 2.5 down to Q 0.4 on a log scale. The attenuation is a fixed
     // high shelf at the ATTEN SEL frequency.
+    //
+    // Above the dial frequency the LC tank keeps the lift going instead of
+    // dropping back to 0 dB at Nyquist, so the air settings add a shelf on top
+    // of the peak. It fades in from 6 kHz so the 3-5 kHz dials stay bells. A
+    // shelf gives half its gain at its corner, so the peak is trimmed by half
+    // the shelf gain to keep the dial value as the gain at the dial frequency.
     const double broadness = juce::jlimit (0.0, 1.0, static_cast<double> (bandwidth) / 10.0);
     const double boostQ = 2.5 * std::pow (0.16, broadness);
-    makePeaking (band.stages[2], sampleRate, highFrequencyHz, boostQ, highBoostDb);
-    makeHighShelf (band.stages[3], sampleRate, attenuationFrequencyHz, 0.6, -static_cast<double> (highAttenDb));
+    const double airDb = highBoostDb * 0.6 * juce::jlimit (0.0, 1.0, (highFrequencyHz - 6000.0) / 10000.0);
+    makePeaking (band.stages[2], sampleRate, highFrequencyHz, boostQ, highBoostDb - 0.5 * airDb);
+    makeHighShelf (band.stages[3], sampleRate, highFrequencyHz, 0.7, airDb);
+    makeHighShelf (band.stages[4], sampleRate, attenuationFrequencyHz, 0.6, -static_cast<double> (highAttenDb));
 
     return band;
 }
 
 FullteqAudioProcessor::BandCoefficients FullteqAudioProcessor::makeBand (
-    float lowBoostDb, float lowAttenDb, float lowQ, float highBoostDb, float highAttenDb, float bandwidth) const
+    float lowBoostDb, float lowAttenDb, float lowQ, float lowFreqChoice, float highBoostDb, float highAttenDb, float bandwidth) const
 {
-    const int lowIndex = indexFromChoice (*apvts.getRawParameterValue ("lowFreq"), (int) lowFrequencies.size());
+    const int lowIndex = indexFromChoice (lowFreqChoice, (int) lowFrequencies.size());
     const int highIndex = indexFromChoice (*apvts.getRawParameterValue ("highFreq"), (int) highFrequencies.size());
     const int attenIndex = indexFromChoice (*apvts.getRawParameterValue ("attenSel"), (int) attenuationFrequencies.size());
 
@@ -240,6 +276,7 @@ void FullteqAudioProcessor::getResponseDb (const double* frequenciesHz, float* o
 {
     const BandCoefficients band = makeBand (*apvts.getRawParameterValue ("lowBoost"), *apvts.getRawParameterValue ("lowAtten"),
                                             *apvts.getRawParameterValue ("lowQ"),
+                                            *apvts.getRawParameterValue ("lowFreq"),
                                             *apvts.getRawParameterValue ("highBoost"), *apvts.getRawParameterValue ("highAtten"),
                                             *apvts.getRawParameterValue ("bandwidth"));
 
@@ -249,6 +286,7 @@ void FullteqAudioProcessor::getResponseDb (const double* frequenciesHz, float* o
         double magnitude = 1.0;
         for (const auto& stage : band.stages)
             magnitude *= stageMagnitudeLinear (stage, hz, currentSampleRate);
+
 
         outDb[i] = juce::Decibels::gainToDecibels (static_cast<float> (magnitude));
     }
@@ -311,6 +349,9 @@ void FullteqAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     const double osRate = sampleRate * oversamplingFactor;
     dcBlockCoeff = 1.0 - 2.0 * kPi * 5.0 / osRate;
     transformerLowCoeff = 1.0 - std::exp (-2.0 * kPi * 160.0 / osRate);
+    oversampledRate = osRate;
+    highLossCoeff = 1.0 - std::exp (-2.0 * kPi * kHighLossCornerHz / osRate);
+    highCapCoeff = 1.0 - std::exp (-2.0 * kPi * kHighLossCapHz / osRate);
 
     dryBuffer.setSize (numChannels, maxBlockSize, false, false, true);
     dryDelay.assign ((size_t) numChannels, std::vector<float> ((size_t) juce::jmax (0, latencySamples), 0.0f));
@@ -392,6 +433,13 @@ void FullteqAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     for (int ch = totalNumInputChannels; ch < totalNumOutputChannels; ++ch)
         buffer.clear (ch, 0, numSamples);
 
+    // A host passes on whatever an upstream plug-in left behind, and one non-finite
+    // sample latches in the nonlinear state for good (pluginval fuzz does this too).
+    for (int ch = 0; ch < juce::jmin (totalNumInputChannels, buffer.getNumChannels()); ++ch)
+        for (float* d = buffer.getWritePointer (ch), *last = d + numSamples; d != last; ++d)
+            if (! std::isfinite (*d))
+                *d = 0.0f;
+
     const int numCh = juce::jmin (totalNumInputChannels, buffer.getNumChannels(), (int) channelFilters.size());
     if (numSamples <= 0 || numCh <= 0 || oversampler == nullptr)
         return;
@@ -448,6 +496,17 @@ void FullteqAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     const bool tubeOn = *apvts.getRawParameterValue ("tube") >= 0.5f;
     const bool transformerOn = *apvts.getRawParameterValue ("transformer") >= 0.5f;
 
+    // Core drive follows the low band, the way the real unit's output
+    // transformer is pushed by a big low-boost lift. Only the boost and the
+    // drive knob raise it: attenuation adds no flux.
+    const double driveKnob = (double) *apvts.getRawParameterValue ("drive");
+    const double liftDb = kLowBoostDriveDb * std::max (0.0, (double) lowBoostSmoothed.getTargetValue()) / 8.0;
+    // Anchor: at the default drive (0.15) and no low boost, coreDrive is 1.0, so
+    // the core behaves exactly as it did before the band link existed (the 50 Hz
+    // lift test measures that state). Boost and the drive knob raise it from there.
+    coreDrive = std::pow (10.0, (liftDb + 6.0 * (driveKnob - 0.15)) / 20.0);
+    coreBias = 0.12 + 0.18 * (double) *apvts.getRawParameterValue ("drive");
+
     // Filter coefficients are updated once per block from the smoothed value
     // at the end of the block; gains, drive and the bypass mix ramp per sample.
     const float lowBoostDb = lowBoostSmoothed.skip (numSamples);
@@ -469,7 +528,8 @@ void FullteqAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     dryBuffer.makeCopyOf (buffer, true);
     applyDryDelay (dryBuffer, numCh, numSamples);
 
-    const BandCoefficients band = makeBand (lowBoostDb, lowAttenDb, lowQ, highBoostDb, highAttenDb, bandwidth);
+    BandCoefficients band = makeBand (lowBoostDb, lowAttenDb, lowQ, *apvts.getRawParameterValue ("lowFreq"),
+                                      highBoostDb, highAttenDb, bandwidth);
 
     // 1) Passive EQ network.
     for (int ch = 0; ch < numCh; ++ch)
@@ -485,10 +545,8 @@ void FullteqAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         for (int i = 0; i < numSamples; ++i)
         {
             float y = data[i] * inGainRamp[(size_t) i];
-            y = stages[0].process (y);
-            y = stages[1].process (y);
-            y = stages[2].process (y);
-            y = stages[3].process (y);
+            for (auto& stage : stages)
+                y = stage.process (y);
             data[i] = y;
         }
     }
@@ -530,12 +588,102 @@ void FullteqAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
 
                 if (transformerOn)
                 {
-                    // Core saturation: only the low band (where the flux is
-                    // highest) is compressed, highs pass untouched.
-                    const double m = 1.2 + 1.8 * drive;
+                    // Core model. The low band (where the flux is) drives it, so
+                    // a low-boost lift pushes the iron harder - the band that
+                    // carries the energy saturates first, as on the hardware.
+                    const double m = (1.2 + 1.8 * drive) * coreDrive;
                     state.transformerLow += transformerLowCoeff * (x - state.transformerLow);
-                    const double low = state.transformerLow;
-                    x = (x - low) + std::tanh (m * low) / m;
+                    const double flux = state.transformerLow;
+
+                    // Asymmetric shaper: tanh for odd harmonics, bias for the
+                    // even ones, normalised to unity small-signal gain.
+                    const double tb = std::tanh (coreBias);
+                    const double shaped = (std::tanh (m * flux + coreBias) - tb) / (m * (1.0 - tb * tb));
+
+                    // Hysteresis (Preisach-style play operator): the core output
+                    // only follows the flux once it has moved far enough past
+                    // where it last turned around, so it lags on the way back and
+                    // remembers the previous swing.
+                    // Loop width: a fraction of the shaper slope, the physical
+                    // scale of where the core turns around. Scaling it with the
+                    // signal level instead swallows quiet material, so it stays
+                    // tied to the drive (which is what sets the core's working
+                    // point) and to the shaper slope.
+                    // Core loss at high frequency.
+                    //
+                    // Measuring loss from the core's own flux does not work: the
+                    // flux path is a lowpass, so a faster tone arrives smaller by
+                    // about as much as it changes faster, and |dPhi/dt| barely
+                    // moves with pitch (measured: 61 -> 249 for 40 -> 400 Hz,
+                    // while the saturation point stayed flat). The extra loss is
+                    // therefore modelled on its own path: the band above the
+                    // flux corner is lifted out of the signal, the core's
+                    // dissipation is applied to it, and it is mixed back. Its
+                    // level comes from the tone itself, so higher tones lose more.
+                    state.coreHighLow += highLossCoeff * (x - state.coreHighLow);
+                    const double aboveLowPass = x - state.coreHighLow;
+                    // Cap the band: real iron loss flattens out rather than
+                    // growing without limit, and the transformer must not take
+                    // level from the top end (contract in tests 7 and 12).
+                    state.coreHighBand += highCapCoeff * (aboveLowPass - state.coreHighBand);
+                    const double highBand = aboveLowPass - state.coreHighBand;
+
+                    // Iron dissipates the top octaves harder than the body of the
+                    // signal. The high band is shaped on its own and added back,
+                    // so a 400 Hz tone carries real loss while a 40 Hz one barely
+                    // touches this path. Frequency weighting comes from the
+                    // split itself, not from measuring flux rate.
+                    // Only loss: tanh compresses peaks, so dividing by the slope
+                    // (hb) keeps unity small-signal gain and the difference is
+                    // never positive - the path can only take energy away.
+                    const double hb = kHighLossDepth;
+                    const double lostBand = std::min (0.0, std::tanh (hb * highBand) / hb - highBand);
+
+                    // Hysteresis (Preisach-style play operator): the core only
+                    // follows the flux once it has moved past where it last
+                    // turned around, so it lags on the way back and remembers
+                    // the previous swing. The width is tied to the shaper slope
+                    // (the core's working point), not to the signal level, which
+                    // would swallow quiet material.
+                    // Loop width grows with how fast the core is being driven.
+                    // A static play operator gives every pitch an identical loop
+                    // (measured: gap 0.048 at 31 Hz through 1 kHz), so the iron
+                    // responded to frequency not at all. Here the width scales
+                    // with the shaper's slope normalised by the pitch, so faster
+                    // flux means a wider loop and a longer memory.
+                    // Pitch, not level: count how long a half-swing takes by
+                    // timing the sign changes of the core's slope. That is the
+                    // frequency the iron actually sees, independent of amplitude.
+                    const double dShaped = shaped - state.prevShaped;
+                    if (dShaped > 0.0 && state.prevSlope <= 0.0)
+                    {
+                        if (state.samplesSinceTurn > 0)
+                        {
+                            const double halfPeriod = state.samplesSinceTurn / oversampledRate;
+                            if (halfPeriod > 1.0e-5 && halfPeriod < 5.0e-2)
+                                state.shapeRate += 0.05 * (0.5 / halfPeriod - state.shapeRate);
+                        }
+                        state.samplesSinceTurn = 0;
+                    }
+                    ++state.samplesSinceTurn;
+                    state.prevSlope = dShaped;
+                    const double widthScale = std::clamp (1.0 + kHysteresisRatePerOctave * std::log2 (std::max (1.0, state.shapeRate / kHysteresisRefRate)),
+                                                          0.25, kHysteresisMaxScale);
+                    const double width = hysteresisWidth * m * widthScale;
+                    if (shaped > state.magnetisation + width)
+                        state.magnetisation = shaped - width;
+                    else if (shaped < state.magnetisation - width)
+                        state.magnetisation = shaped + width;
+
+                    state.prev = flux;
+                    state.prevShaped = shaped;
+
+                    // Hysteresis enters as the memory term only: the gap between
+                    // where the core is and where the flux says it should be.
+                    // The direct signal keeps its full level, so the band's gain
+                    // is untouched and only the history is new.
+                    x = (x - flux) + shaped + kHysteresisShare * (state.magnetisation - shaped) + 0.08 * flux
+                        + kHighLossMix * lostBand;
                 }
 
                 data[j] = static_cast<float> (x);

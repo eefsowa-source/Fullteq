@@ -13,20 +13,25 @@ FetchContent_Declare(juce
 FetchContent_MakeAvailable(juce)
 
 juce_add_plugin(Fullteq
-  COMPANY_NAME "Fullteq Audio"
-  BUNDLE_ID com.fullteq.audio
+  COMPANY_NAME "EEF LABs"
+  BUNDLE_ID com.eeflabs.fullteq
   IS_SYNTH FALSE
   NEEDS_MIDI_INPUT FALSE
   NEEDS_MIDI_OUTPUT FALSE
   IS_MIDI_EFFECT FALSE
   EDITOR_WANTS_KEYBOARD_FOCUS FALSE
   COPY_PLUGIN_AFTER_BUILD TRUE
-  PLUGIN_MANUFACTURER_CODE Fteq
+  PLUGIN_MANUFACTURER_CODE EEFL
   PLUGIN_CODE Fteq
   FORMATS VST3 AU Standalone
   PRODUCT_NAME "Fullteq")
 
 juce_generate_juce_header(Fullteq)
+
+# Silkscreen typeface embedded in the binary so the UI never depends on
+# fonts installed on the user's machine. Jost is SIL OFL 1.1 (Source/Fonts/OFL.txt).
+juce_add_binary_data(FullteqFonts
+  SOURCES Source/Fonts/JostRegular.ttf Source/Fonts/JostSemiBold.ttf)
 
 target_sources(Fullteq PRIVATE
   Source/PluginProcessor.cpp
@@ -38,6 +43,7 @@ target_compile_definitions(Fullteq PRIVATE
   JUCE_VST3_CAN_REPLACE_VST2=0)
 
 target_link_libraries(Fullteq PRIVATE
+  FullteqFonts
   juce::juce_audio_utils
   juce::juce_dsp
   juce::juce_recommended_config_flags
@@ -57,6 +63,7 @@ target_compile_definitions(FullteqTests PRIVATE
   JUCE_USE_CURL=0
   JucePlugin_Name="Fullteq")
 target_link_libraries(FullteqTests PRIVATE
+  FullteqFonts
   juce::juce_audio_utils
   juce::juce_dsp
   juce::juce_recommended_config_flags)
